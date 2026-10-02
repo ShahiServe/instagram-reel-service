@@ -295,6 +295,60 @@ async function createShopifyFile({
 
 
 /**
+ * Find a video already saved for this reel filename.
+ */
+async function findShopifyVideoByFilename(
+    filename
+) {
+    const query = `
+    query FindVideoByFilename($query: String!) {
+      files(first: 5, query: $query) {
+        nodes {
+          ... on Video {
+            id
+            filename
+            fileStatus
+            sources {
+              url
+              mimeType
+              format
+            }
+          }
+        }
+      }
+    }
+  `;
+
+    const data = await shopifyGraphQL(
+        query,
+        {
+            query: `filename:${filename}`,
+        }
+    );
+
+    const matches = (
+        data.files?.nodes || []
+    ).filter(
+        (file) =>
+            file &&
+            file.filename === filename
+    );
+
+    return (
+        matches.find(
+            (file) =>
+                file.fileStatus === "READY"
+        ) ||
+        matches.find(
+            (file) =>
+                file.fileStatus !== "FAILED"
+        ) ||
+        null
+    );
+}
+
+
+/**
  * Get the current state of a Shopify File.
  */
 async function getShopifyFile(
@@ -408,6 +462,7 @@ module.exports = {
     createStagedUpload,
     uploadToStagedTarget,
     createShopifyFile,
+    findShopifyVideoByFilename,
     getShopifyFile,
     waitForShopifyFile,
 };

@@ -1,0 +1,17 @@
+{
+  "name": "instagram-reel-resolver",
+  "version": "1.0.0",
+  "description": "Instagram Reel resolver using SaveAPI",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.0.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}

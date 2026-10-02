@@ -9,10 +9,31 @@ const {
   createStagedUpload,
   uploadToStagedTarget,
   createShopifyFile,
+  findShopifyVideoByFilename,
   waitForShopifyFile,
 } = require("../services/shopify");
 
 const router = express.Router();
+
+const uploadJobs = new Map();
+
+function reelFilename(instagramUrl) {
+  try {
+    const code = new URL(instagramUrl)
+      .pathname
+      .split("/")
+      .filter(Boolean)[1]
+      ?.replace(/[^a-zA-Z0-9_-]/g, "");
+
+    if (!code) {
+      return null;
+    }
+
+    return `instagram-reel-${code}.mp4`;
+  } catch (error) {
+    return null;
+  }
+}
 
 router.post("/reel", async (req, res) => {
   const requestId = crypto.randomUUID();
@@ -42,7 +63,94 @@ router.post("/reel", async (req, res) => {
     });
   }
 
+  const filename =
+    reelFilename(instagramUrl) ||
+    `instagram-reel-${Date.now()}.mp4`;
+
+  if (uploadJobs.has(filename)) {
+    try {
+      const result = await uploadJobs.get(filename);
+
+      return res.status(200).json({
+        ...result,
+        requestId,
+      });
+    } catch (error) {
+      return res.status(
+        error.status || 500
+      ).json({
+        success: false,
+        error:
+          error.code ||
+          "REEL_PROCESSING_ERROR",
+        message: error.message,
+        requestId,
+      });
+    }
+  }
+
+  let resolveJob;
+  let rejectJob;
+
+  const job = new Promise((resolve, reject) => {
+    resolveJob = resolve;
+    rejectJob = reject;
+  });
+
+  uploadJobs.set(filename, job);
+
   try {
+    let existing = null;
+
+    try {
+      existing =
+        await findShopifyVideoByFilename(
+          filename
+        );
+    } catch (lookupError) {
+      console.error(
+        `[${requestId}] Existing reel lookup failed`,
+        lookupError.message
+      );
+    }
+
+    if (
+      existing &&
+      existing.fileStatus !== "FAILED"
+    ) {
+      let videoUrl = null;
+
+      if (existing.fileStatus === "READY") {
+        videoUrl = existing.sources?.find(
+          (item) =>
+            item.url &&
+            (item.mimeType === "video/mp4" ||
+              item.format === "mp4")
+        )?.url;
+      }
+
+      if (!videoUrl) {
+        const readyFile =
+          await waitForShopifyFile({
+            fileId: existing.id,
+          });
+
+        videoUrl = readyFile.videoUrl;
+      }
+
+      const payload = {
+        success: true,
+        videoUrl,
+        shopifyFileId: existing.id,
+        fileStatus: "READY",
+        requestId,
+      };
+
+      resolveJob(payload);
+
+      return res.status(200).json(payload);
+    }
+
     // -----------------------------------------
     // 2. Resolve Instagram Reel using SaveAPI
     // -----------------------------------------
@@ -157,9 +265,6 @@ router.post("/reel", async (req, res) => {
     // 4. Create Shopify staged upload
     // -----------------------------------------
 
-    const filename =
-      `instagram-reel-${Date.now()}.mp4`;
-
     console.log(
       `[${requestId}] Creating Shopify staged upload`,
       {
@@ -252,7 +357,7 @@ router.post("/reel", async (req, res) => {
     // 8. Return Shopify CDN URL
     // -----------------------------------------
 
-    return res.status(200).json({
+    const payload = {
       success: true,
 
       videoUrl:
@@ -265,7 +370,11 @@ router.post("/reel", async (req, res) => {
         readyFile.fileStatus,
 
       requestId,
-    });
+    };
+
+    resolveJob(payload);
+
+    return res.status(200).json(payload);
 
   } catch (error) {
     // -----------------------------------------
@@ -281,6 +390,9 @@ router.post("/reel", async (req, res) => {
           error.stack,
       }
     );
+
+    uploadJobs.delete(filename);
+    rejectJob(error);
 
     return res.status(
       error.status || 500

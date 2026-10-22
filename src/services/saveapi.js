@@ -1,3 +1,5 @@
+const { parseInstagramReelUrl } = require("../utils/instagram");
+
 const SAVEAPI_URL = "https://api.saveapi.org/v1/download";
 
 class ResolverError extends Error {
@@ -12,47 +14,17 @@ class ResolverError extends Error {
 }
 
 function validateInstagramUrl(value) {
-  try {
-    const url = new URL(value);
+  const parsed = parseInstagramReelUrl(value);
 
-    const hostname = url.hostname.toLowerCase();
-
-    const isInstagram =
-      hostname === "instagram.com" ||
-      hostname === "www.instagram.com";
-
-    if (!isInstagram) {
-      throw new ResolverError(
-        "Only Instagram URLs are supported",
-        "INVALID_PLATFORM",
-        400
-      );
-    }
-
-    const isReel =
-      url.pathname.startsWith("/reel/") ||
-      url.pathname.startsWith("/reels/");
-
-    if (!isReel) {
-      throw new ResolverError(
-        "URL must be an Instagram Reel",
-        "INVALID_REEL_URL",
-        400
-      );
-    }
-
-    return url.toString();
-  } catch (error) {
-    if (error instanceof ResolverError) {
-      throw error;
-    }
-
+  if (!parsed) {
     throw new ResolverError(
-      "Invalid Instagram Reel URL",
-      "INVALID_URL",
+      "Use a public Instagram reel URL, e.g. https://www.instagram.com/reel/CODE/",
+      "INVALID_REEL_URL",
       400
     );
   }
+
+  return parsed.canonicalUrl;
 }
 
 async function requestSaveAPI(instagramUrl) {
@@ -99,48 +71,25 @@ async function requestSaveAPI(instagramUrl) {
     const code = data?.error?.code || "UPSTREAM_ERROR";
 
     const message =
-      data?.error?.message ||
-      "SaveAPI failed to resolve the Instagram Reel";
+      data?.error?.message || "SaveAPI failed to resolve the Instagram Reel";
 
     if (code === "PRIVATE_CONTENT") {
-      throw new ResolverError(
-        message,
-        code,
-        403
-      );
+      throw new ResolverError(message, code, 403);
     }
 
     if (code === "MEDIA_NOT_FOUND") {
-      throw new ResolverError(
-        message,
-        code,
-        404
-      );
+      throw new ResolverError(message, code, 404);
     }
 
     if (code === "RATE_LIMITED") {
-      throw new ResolverError(
-        message,
-        code,
-        429,
-        true
-      );
+      throw new ResolverError(message, code, 429, true);
     }
 
     if (code === "QUOTA_EXCEEDED") {
-      throw new ResolverError(
-        message,
-        code,
-        429
-      );
+      throw new ResolverError(message, code, 429);
     }
 
-    throw new ResolverError(
-      message,
-      code,
-      502,
-      true
-    );
+    throw new ResolverError(message, code, 502, true);
   }
 
   return data;
@@ -158,19 +107,10 @@ async function resolveInstagramReel(instagramUrl) {
   }
 
   const data = await requestSaveAPI(validatedUrl);
-console.log("SAVEAPI MEDIAS:", JSON.stringify(data.medias, null, 2));
- const video = data.medias?.find(
-  (media) =>
-    media.type === "video" &&
-    media.url
-);
 
-console.log("SELECTED VIDEO:", {
-  type: video?.type,
-  ext: video?.ext,
-  format: video?.format,
-  url: video?.url,
-});
+  const video = data.medias?.find(
+    (media) => media.type === "video" && media.url
+  );
 
   if (!video) {
     throw new ResolverError(
@@ -179,8 +119,6 @@ console.log("SELECTED VIDEO:", {
       404
     );
   }
-
-  
 
   return {
     videoUrl: video.url,

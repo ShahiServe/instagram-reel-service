@@ -5,3 +5,6 @@ node_modules/
 dist/
 build/
 .DS_Store
+reel-video-embed.liquid
+testimonial.js
+testimonial.liquid

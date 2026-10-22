@@ -1,9 +1,8 @@
 const express = require("express");
 const crypto = require("crypto");
 
-const {
-  resolveInstagramReel,
-} = require("../services/saveapi");
+const { resolveInstagramReel } = require("../services/saveapi");
+const { parseInstagramReelUrl } = require("../utils/instagram");
 
 const {
   createStagedUpload,
@@ -11,61 +10,68 @@ const {
   createShopifyFile,
   findShopifyVideoByFilename,
   waitForShopifyFile,
+  getReelsMetafield,
+  saveReelToMetafield,
 } = require("../services/shopify");
 
 const router = express.Router();
 
+// In-flight jobs only (de-dupes simultaneous requests for the same reel).
+// Entries are removed as soon as a job settles; the metafield is the
+// permanent cache.
 const uploadJobs = new Map();
 
-function reelFilename(instagramUrl) {
+/**
+ * Add the uploaded file to the custom.testimonial_reels metafield.
+ * Never fails the request: the file already exists in Shopify.
+ */
+async function persistReel(fileId) {
+  if (!fileId) {
+    return;
+  }
+
   try {
-    const code = new URL(instagramUrl)
-      .pathname
-      .split("/")
-      .filter(Boolean)[1]
-      ?.replace(/[^a-zA-Z0-9_-]/g, "");
-
-    if (!code) {
-      return null;
-    }
-
-    return `instagram-reel-${code}.mp4`;
+    await saveReelToMetafield(fileId);
   } catch (error) {
-    return null;
+    console.error("Reel metafield save failed", error.message);
   }
 }
 
 router.post("/reel", async (req, res) => {
   const requestId = crypto.randomUUID();
 
-  const {
-    url: instagramUrl,
-  } = req.body;
+  const { url: instagramUrl } = req.body;
 
-  console.log(
-    `[${requestId}] Reel upload request received`
-  );
+  console.log(`[${requestId}] Reel upload request received`);
 
   // -----------------------------------------
   // 1. Validate request
   // -----------------------------------------
 
-  if (
-    !instagramUrl ||
-    typeof instagramUrl !== "string"
-  ) {
+  if (!instagramUrl || typeof instagramUrl !== "string") {
     return res.status(400).json({
       success: false,
       error: "INVALID_REQUEST",
-      message:
-        "Instagram Reel URL is required",
+      message: "Instagram Reel URL is required",
       requestId,
     });
   }
 
-  const filename =
-    reelFilename(instagramUrl) ||
-    `instagram-reel-${Date.now()}.mp4`;
+  const parsed = parseInstagramReelUrl(instagramUrl);
+
+  if (!parsed) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_REEL_URL",
+      message:
+        "Use a public Instagram reel URL, e.g. https://www.instagram.com/reel/CODE/",
+      requestId,
+    });
+  }
+
+  const { code, canonicalUrl } = parsed;
+
+  const filename = `instagram-reel-${code}.mp4`;
 
   if (uploadJobs.has(filename)) {
     try {
@@ -76,13 +82,9 @@ router.post("/reel", async (req, res) => {
         requestId,
       });
     } catch (error) {
-      return res.status(
-        error.status || 500
-      ).json({
+      return res.status(error.status || 500).json({
         success: false,
-        error:
-          error.code ||
-          "REEL_PROCESSING_ERROR",
+        error: error.code || "REEL_PROCESSING_ERROR",
         message: error.message,
         requestId,
       });
@@ -97,16 +99,66 @@ router.post("/reel", async (req, res) => {
     rejectJob = reject;
   });
 
+  // Prevent an unhandled rejection when nobody else is waiting on this job
+  job.catch(() => {});
+
   uploadJobs.set(filename, job);
 
+  function finish(payload) {
+    resolveJob(payload);
+    uploadJobs.delete(filename);
+
+    return res.status(200).json(payload);
+  }
+
   try {
+    // -----------------------------------------
+    // 2. Cheapest check: already in the metafield?
+    // -----------------------------------------
+
+    if (code) {
+      try {
+        const { videos } = await getReelsMetafield();
+
+        const saved = videos.find(
+          (video) =>
+            video.filename === filename && video.fileStatus === "READY"
+        );
+
+        const savedUrl = saved?.sources?.find(
+          (item) =>
+            item.url &&
+            (item.mimeType === "video/mp4" || item.format === "mp4")
+        )?.url;
+
+        if (savedUrl) {
+          console.log(`[${requestId}] Reel found in metafield`);
+
+          return finish({
+            success: true,
+            videoUrl: savedUrl,
+            shopifyFileId: saved.id,
+            fileStatus: "READY",
+            requestId,
+          });
+        }
+      } catch (metafieldError) {
+        console.error(
+          `[${requestId}] Metafield lookup failed`,
+          metafieldError.message
+        );
+      }
+    }
+
+    // -----------------------------------------
+    // 3. Already uploaded to Shopify Files?
+    //    (backfills reels uploaded before the metafield existed)
+    // -----------------------------------------
+
     let existing = null;
 
     try {
-      existing =
-        await findShopifyVideoByFilename(
-          filename
-        );
+      existing = await findShopifyVideoByFilename(filename);
     } catch (lookupError) {
       console.error(
         `[${requestId}] Existing reel lookup failed`,
@@ -114,93 +166,64 @@ router.post("/reel", async (req, res) => {
       );
     }
 
-    if (
-      existing &&
-      existing.fileStatus !== "FAILED"
-    ) {
+    if (existing && existing.fileStatus !== "FAILED") {
       let videoUrl = null;
 
       if (existing.fileStatus === "READY") {
         videoUrl = existing.sources?.find(
           (item) =>
             item.url &&
-            (item.mimeType === "video/mp4" ||
-              item.format === "mp4")
+            (item.mimeType === "video/mp4" || item.format === "mp4")
         )?.url;
       }
 
       if (!videoUrl) {
-        const readyFile =
-          await waitForShopifyFile({
-            fileId: existing.id,
-          });
+        const readyFile = await waitForShopifyFile({
+          fileId: existing.id,
+        });
 
         videoUrl = readyFile.videoUrl;
       }
 
-      const payload = {
+      await persistReel(existing.id);
+
+      return finish({
         success: true,
         videoUrl,
         shopifyFileId: existing.id,
         fileStatus: "READY",
         requestId,
-      };
-
-      resolveJob(payload);
-
-      return res.status(200).json(payload);
+      });
     }
 
     // -----------------------------------------
-    // 2. Resolve Instagram Reel using SaveAPI
+    // 4. Resolve Instagram Reel using SaveAPI
     // -----------------------------------------
 
-    console.log(
-      `[${requestId}] Resolving Instagram Reel`
-    );
+    console.log(`[${requestId}] Resolving Instagram Reel`);
 
-    const resolved =
-      await resolveInstagramReel(
-        instagramUrl
-      );
+    const resolved = await resolveInstagramReel(canonicalUrl);
 
     if (!resolved?.videoUrl) {
-      throw new Error(
-        "SaveAPI did not return a video URL"
-      );
+      throw new Error("SaveAPI did not return a video URL");
     }
 
-    console.log(
-      `[${requestId}] Instagram Reel resolved`
-    );
-
-    console.log(
-      `[${requestId}] Source video URL received`
-    );
+    console.log(`[${requestId}] Instagram Reel resolved`);
 
     // -----------------------------------------
-    // 3. Download video from Instagram CDN
+    // 5. Download video from Instagram CDN
     // -----------------------------------------
 
-    console.log(
-      `[${requestId}] Downloading video`
-    );
+    console.log(`[${requestId}] Downloading video`);
 
-    const videoResponse =
-      await fetch(
-        resolved.videoUrl,
-        {
-          method: "GET",
-          headers: {
-            Accept: "video/mp4,video/*,*/*",
-          },
-          signal:
-            AbortSignal.timeout(
-              60_000
-            ),
-          redirect: "follow",
-        }
-      );
+    const videoResponse = await fetch(resolved.videoUrl, {
+      method: "GET",
+      headers: {
+        Accept: "video/mp4,video/*,*/*",
+      },
+      signal: AbortSignal.timeout(60_000),
+      redirect: "follow",
+    });
 
     if (!videoResponse.ok) {
       throw new Error(
@@ -208,90 +231,40 @@ router.post("/reel", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // IMPORTANT:
-    // Do not trust Instagram's content-type.
-    // Shopify should receive this as MP4.
-    // -----------------------------------------
+    // Do not trust Instagram's content-type. Shopify should receive MP4.
+    const mimeType = "video/mp4";
 
-    const mimeType =
-      "video/mp4";
+    const arrayBuffer = await videoResponse.arrayBuffer();
 
-    const contentLength =
-      videoResponse.headers.get(
-        "content-length"
-      );
+    const videoBuffer = Buffer.from(arrayBuffer);
 
-    console.log(
-      `[${requestId}] Instagram response`,
-      {
-        contentType:
-          videoResponse.headers.get(
-            "content-type"
-          ),
-        contentLength,
-      }
-    );
-
-    const arrayBuffer =
-      await videoResponse.arrayBuffer();
-
-    const videoBuffer =
-      Buffer.from(arrayBuffer);
-
-    const fileSize =
-      videoBuffer.length;
+    const fileSize = videoBuffer.length;
 
     if (fileSize === 0) {
-      throw new Error(
-        "Downloaded video is empty"
-      );
+      throw new Error("Downloaded video is empty");
     }
 
-    console.log(
-      `[${requestId}] Video downloaded`,
-      {
-        fileSize,
-        fileSizeMB: (
-          fileSize /
-          1024 /
-          1024
-        ).toFixed(2),
-        mimeType,
-      }
-    );
+    console.log(`[${requestId}] Video downloaded`, {
+      fileSize,
+      fileSizeMB: (fileSize / 1024 / 1024).toFixed(2),
+      mimeType,
+    });
 
     // -----------------------------------------
-    // 4. Create Shopify staged upload
+    // 6. Create Shopify staged upload
     // -----------------------------------------
 
-    console.log(
-      `[${requestId}] Creating Shopify staged upload`,
-      {
-        filename,
-        fileSize,
-        mimeType,
-      }
-    );
+    const stagedTarget = await createStagedUpload({
+      filename,
+      mimeType,
+      fileSize,
+    });
 
-    const stagedTarget =
-      await createStagedUpload({
-        filename,
-        mimeType,
-        fileSize,
-      });
-
-    console.log(
-      `[${requestId}] Shopify staged target created`
-    );
+    console.log(`[${requestId}] Shopify staged target created`);
 
     // -----------------------------------------
-    // 5. Upload MP4 to Shopify staging
+    // 7. Upload MP4 to Shopify staging
     // -----------------------------------------
-
-    console.log(
-      `[${requestId}] Uploading video to Shopify staging`
-    );
 
     await uploadToStagedTarget({
       stagedTarget,
@@ -300,112 +273,65 @@ router.post("/reel", async (req, res) => {
       mimeType,
     });
 
-    console.log(
-      `[${requestId}] Video uploaded to Shopify staging`
-    );
+    console.log(`[${requestId}] Video uploaded to Shopify staging`);
 
     // -----------------------------------------
-    // 6. Create Shopify Files video
+    // 8. Create Shopify Files video
     // -----------------------------------------
 
-    console.log(
-      `[${requestId}] Creating Shopify Files video`
-    );
+    const shopifyFile = await createShopifyFile({
+      resourceUrl: stagedTarget.resourceUrl,
+      filename,
+    });
 
-    const shopifyFile =
-      await createShopifyFile({
-        resourceUrl:
-          stagedTarget.resourceUrl,
-        filename,
-      });
-
-    console.log(
-      `[${requestId}] Shopify file created`,
-      {
-        fileId:
-          shopifyFile.id,
-        fileStatus:
-          shopifyFile.fileStatus,
-      }
-    );
+    console.log(`[${requestId}] Shopify file created`, {
+      fileId: shopifyFile.id,
+      fileStatus: shopifyFile.fileStatus,
+    });
 
     // -----------------------------------------
-    // 7. Wait for Shopify video processing
+    // 9. Wait for Shopify video processing
     // -----------------------------------------
 
-    console.log(
-      `[${requestId}] Waiting for Shopify video processing`
-    );
+    const readyFile = await waitForShopifyFile({
+      fileId: shopifyFile.id,
+    });
 
-    const readyFile =
-      await waitForShopifyFile({
-        fileId:
-          shopifyFile.id,
-      });
-
-    console.log(
-      `[${requestId}] Shopify video is READY`,
-      {
-        fileId:
-          readyFile.id,
-        videoUrl:
-          readyFile.videoUrl,
-      }
-    );
+    console.log(`[${requestId}] Shopify video is READY`, {
+      fileId: readyFile.id,
+      videoUrl: readyFile.videoUrl,
+    });
 
     // -----------------------------------------
-    // 8. Return Shopify CDN URL
+    // 10. Save CDN url to the metafield
     // -----------------------------------------
 
-    const payload = {
+    await persistReel(readyFile.id);
+
+    // -----------------------------------------
+    // 11. Return Shopify CDN URL
+    // -----------------------------------------
+
+    return finish({
       success: true,
-
-      videoUrl:
-        readyFile.videoUrl,
-
-      shopifyFileId:
-        readyFile.id,
-
-      fileStatus:
-        readyFile.fileStatus,
-
+      videoUrl: readyFile.videoUrl,
+      shopifyFileId: readyFile.id,
+      fileStatus: readyFile.fileStatus,
       requestId,
-    };
-
-    resolveJob(payload);
-
-    return res.status(200).json(payload);
-
+    });
   } catch (error) {
-    // -----------------------------------------
-    // Error handling
-    // -----------------------------------------
-
-    console.error(
-      `[${requestId}] Reel processing failed`,
-      {
-        message:
-          error.message,
-        stack:
-          error.stack,
-      }
-    );
+    console.error(`[${requestId}] Reel processing failed`, {
+      message: error.message,
+      stack: error.stack,
+    });
 
     uploadJobs.delete(filename);
     rejectJob(error);
 
-    return res.status(
-      error.status || 500
-    ).json({
+    return res.status(error.status || 500).json({
       success: false,
-
-      error:
-        error.code ||
-        "REEL_PROCESSING_ERROR",
-
-      message:
-        error.message,
-
+      error: error.code || "REEL_PROCESSING_ERROR",
+      message: error.message,
       requestId,
     });
   }
